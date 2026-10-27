@@ -1,0 +1,127 @@
+services:
+  # ======================
+  # Аналитическое хранилище
+  # ======================
+  clickhouse:
+    image: clickhouse/clickhouse-server:26.8         # готовый образ с Docker Hub
+    container_name: clickhouse
+    ports:
+      - "8123:8123"     # HTTP-интерфейс (для запросов)
+      - "9000:9000"     # нативный TCP-интерфейс
+    volumes:
+      - clickhouse_data:/var/lib/clickhouse           # чтобы данные не пропадали
+      - ./clickhouse/init:/docker-entrypoint-initdb.d # скрипты инициализации (по желанию)
+    env_file:
+      - .env
+    environment:
+      CLICKHOUSE_DB: ${CLICKHOUSE_DB}
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD}
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: ${CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT}
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8123/ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - analytics
+
+  # ======================
+  # PostgreSQL — метаданные Redash
+  # (пользователи, дашборды, сохранённые запросы и т.д.)
+  # ======================
+  postgres:
+    image: postgres:15
+    container_name: redash_postgres
+    env_file:
+      - .env
+    environment:
+      POSTGRES_USER: ${REDASH_POSTGRES_USER}
+      POSTGRES_PASSWORD: ${REDASH_POSTGRES_PASSWORD}
+      POSTGRES_DB: ${REDASH_POSTGRES_DB}
+    volumes:
+      - redash_postgres_data:/var/lib/postgresql/data
+    networks:
+      - analytics
+
+  # ======================
+  # Redis — очереди и кэш для Redash
+  # ======================
+  redis:
+    image: redis:7-alpine
+    container_name: redash_redis
+    networks:
+      - analytics
+
+  # ======================
+  # Redash — веб-интерфейс
+  # ======================
+  redash:
+    image: redash/redash:25.1.0
+    container_name: redash
+    depends_on:
+      - postgres
+      - redis
+      - clickhouse
+    ports:
+      - "5001:5000"
+    env_file:
+      - .env
+    environment:
+      REDASH_LOG_LEVEL: INFO
+      REDASH_REDIS_URL: redis://redis:6379/0
+      REDASH_DATABASE_URL: postgresql://${REDASH_POSTGRES_USER}:${REDASH_POSTGRES_PASSWORD}@postgres:5432/${REDASH_POSTGRES_DB}
+      REDASH_COOKIE_SECRET: ${REDASH_COOKIE_SECRET}
+      REDASH_SECRET_KEY: ${REDASH_SECRET_KEY}
+      REDASH_WEB_WORKERS: 2
+    networks:
+      - analytics
+    command: server
+
+  # ======================
+  # Планировщик задач Redash
+  # ======================
+  scheduler:
+    image: redash/redash:25.1.0
+    container_name: redash_scheduler
+    depends_on:
+      - redash
+    env_file:
+      - .env
+    environment:
+      REDASH_REDIS_URL: redis://redis:6379/0
+      REDASH_DATABASE_URL: postgresql://${REDASH_POSTGRES_USER}:${REDASH_POSTGRES_PASSWORD}@postgres:5432/${REDASH_POSTGRES_DB}
+    networks:
+      - analytics
+    command: scheduler
+
+  # ======================
+  # Воркеры, которые выполняют SQL-запросы
+  # ======================
+  worker:
+    image: redash/redash:25.1.0
+    container_name: redash_worker
+    depends_on:
+      - redash
+    env_file:
+      - .env
+    environment:
+      REDASH_REDIS_URL: redis://redis:6379/0
+      REDASH_DATABASE_URL: postgresql://${REDASH_POSTGRES_USER}:${REDASH_POSTGRES_PASSWORD}@postgres:5432/${REDASH_POSTGRES_DB}
+      QUEUES: queries,scheduled_queries,celery
+      WORKERS_COUNT: 2
+    networks:
+      - analytics
+    command: worker
+
+networks:
+  analytics:
+    driver: bridge
+
+volumes:
+  clickhouse_data:
+  redash_postgres_data:
